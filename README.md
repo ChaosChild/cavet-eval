@@ -3,9 +3,11 @@
 A test bench that measures what an agent costs and what it misses, with and
 without cavet, across harnesses and models.
 
-Status: **built, phase 0 measured**. The harness (`bench.py`), the corpus
+Status: **phase 1 running**. The harness (`bench.py`), the corpus
 preparation and the rate card are working. Phase 0 (one repo, T1, eight
-pairs, both arms) ran 2026-09-08/09; phase 1 has not started.
+pairs, both arms) ran 2026-09-08/09 as calibration. Phase 1 - the full
+5 repos x 8 pairs x 2 arms x 2 tasks x 3 reps matrix, T1 first, executed as
+a serial rotation across pairs - started 2026-09-16.
 
 ---
 
@@ -167,11 +169,11 @@ full arm: it reuses arm A's output and adds one session. Budget it as up to
 120 extra runs (5 x 8 x 3 for T2), fewer in practice since a clean arm A run has
 nothing to fix.
 
-**Do not scope phase 1 from this number.** Per-run cost is unknown and varies by
-more than an order of magnitude across pairs. The one measurement taken so far
-suggests it will be dominated by fixed overhead rather than by the task: a
-one-word prompt on OpenCode consumed 39,304 input tokens before any work started.
-Extrapolating a budget from a guess is how a matrix eats a month of quota.
+**Do not scope a matrix from the cross product.** Per-run cost varies by
+more than an order of magnitude across pairs, and a large share of it is
+fixed harness overhead - system prompt and tool definitions paid before any
+task begins - rather than task work. Extrapolating a budget from a guess is
+how a matrix eats a month of quota.
 
 **Phase 0, calibration: 16 runs.** 1 repo (repo 1, the smallest) x 8 pairs
 x 2 arms x 1 task (T1) x 1 rep. Arm C is excluded here; it only applies to T2. Purpose is not results; it is to measure per-run
@@ -179,9 +181,9 @@ wall clock, tokens and cost per pair, and to shake out the integration bugs that
 will exist in five different harness wrappers. Three reps are pointless here
 because nothing is being concluded.
 
-**Phase 1, sized from phase 0.** Once per-pair cost is measured, solve for the
-largest matrix that fits `BUDGET_USD_CAP` with the ordering below, and stop at
-whatever the budget reaches:
+**Phase 1.** The full cross product above, at 3 reps per cell, sized from
+the measured per-pair floor costs (§5.6). Where a budget binds, cut in this
+order and stop at whatever the budget reaches:
 
 1. Both arms, both tasks, 3 reps. These are not negotiable; they are what makes
    it an experiment rather than a demo.
@@ -331,18 +333,19 @@ way (§5.1 shows where each one's usage data lives).
 
 Every model is evaluated in the harness its own vendor ships, because harness and
 model are co-designed: system prompts, tool definitions, context management and
-compaction are all tuned for that pairing, and running GLM inside OpenCode
-measures a configuration nobody actually deploys.
+compaction are all tuned for that pairing.
 
-**Muse Spark is the deliberate exception.** Meta shipped no coding harness for
-it at the time of testing, so that cell is a substitution and is labelled as
-such; if Meta ships a native harness later, the cell should be re-run in it.
+**Muse Spark runs in OpenCode.** Meta ships no first-party coding harness for
+it, so the pair uses OpenCode instead - one of the OG coding harnesses, still
+loved and widely used, and one of the most common ways to drive models not of
+OpenCode's own making (GLM, Claude, ChatGPT and others) headlessly. If Meta
+ships a first-party harness later, the cell is worth re-running in it.
 
 **The cost of this rule, stated up front.** Harness and model become confounded.
 When a cell performs badly the benchmark cannot separate "the model is weaker"
-from "the harness is weaker", and the earlier OpenCode measurement makes that
-concrete: a one-word prompt consumed 39,304 input tokens of harness overhead
-before any task began. Different harnesses carry very different fixed costs.
+from "the harness is weaker" - and harnesses differ widely in fixed overhead,
+which is why the floor-cost probe (§5.6) measures it per pair rather than
+assuming it.
 
 The design accepts this because the unit of interest is what a developer actually
 runs, which is a harness-and-model pair, not a model in isolation. The
@@ -392,15 +395,15 @@ tokens.
 **ZCode.** A SQLite database at `~/.zcode/cli/db/db.sqlite`, and it is the
 richest telemetry of the five. Relevant tables as observed:
 
-- `model_usage`, 12,932 rows here: one row per model request, with
+- `model_usage`: one row per model request, with
   `input_tokens`, `output_tokens`, `reasoning_tokens`,
   `cache_creation_input_tokens`, `cache_read_input_tokens`, `duration_ms`,
   `time_to_first_token_ms`, `tool_call_count`, `retry_count`, `finish_reason`,
   error fields, plus `session_id`, `turn_id`, `trace_id` and a `query_source`
   that distinguishes subagent traffic from the main thread.
-- `turn_usage`, 455 rows: per-turn aggregates including `model_request_count`,
+- `turn_usage`: per-turn aggregates including `model_request_count`,
   `tool_call_count`, `tool_error_count` and the same token fields.
-- `session`, 226 rows: carries `directory` and `path`, plus
+- `session`: carries `directory` and `path`, plus
   `summary_additions`, `summary_deletions` and `summary_files`.
 
 `session.directory` is what makes per-run attribution work: run each cell in its
@@ -501,8 +504,10 @@ checked, since these change.
 
 ### 5.4 OpenCode (Muse Spark 1.3)
 
-OpenCode is in the matrix only as Muse Spark 1.3's substitute harness (§5.0),
-running the opencode-hosted (Zen) model
+OpenCode hosts Muse Spark 1.3 in this matrix (§5.0): one of the OG coding
+harnesses, still loved and widely used, which is exactly why it belongs here -
+driving models not of OpenCode's own making through it is one of its most
+common uses. This evaluation runs the opencode-hosted (Zen) model
 (`opencode/muse-spark-1.3-contributor-free`). Reasoning effort goes through
 `--variant`, which the Zen route honours; the openrouter route ignores it
 (§5.9).
@@ -524,11 +529,10 @@ Usage instead comes from SQLite at `~/.local/share/opencode/opencode.db`. The
   and the opposite of ZCode. One observed row: `tokens_input` 36,158 with
   `tokens_cache_read` 284,928.
 
-**Measured harness overhead.** A one-word probe prompt consumed **39,304
-input tokens** for 5 output tokens - OpenCode's system prompt and tool
-definitions, paid on every run before the task starts. It is a fixed cost both
-arms pay, so it does not bias the A/B comparison, but it dominates absolute
-cost figures: overhead measured per pair (§5.6) is what sizes a real matrix.
+**Fixed harness overhead.** Every run pays for the harness's system prompt and
+tool definitions before any task begins. It is a fixed cost both arms pay, so
+it does not bias the A/B comparison, but it does shape absolute cost figures:
+floor cost is measured per pair (§5.6) and is what a matrix is sized from.
 
 ### 5.5 ZCode configuration, established by experiment
 

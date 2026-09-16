@@ -1,0 +1,29 @@
+# The corpus list is deliberately not published. See README.md, "Ethics".
+# Owner/name exists only in .env. Nothing that describes a subject more
+# precisely than the README's banded table may be committed:
+#
+#   .env                 owner/name, pinned SHAs, precise ratios
+#   t2.local.json        real T2 task text (quotes in-repo file paths)
+#   T2-tasks.md          internal task design notes (same reason)
+#   corpus-manifest.json per-repo file/byte histograms (a verification oracle)
+#   runs/                per-run records; final responses quote the tree
+#   repositories/, work/, probe/, runs/logs/   local artefacts
+#
+# Published artefacts are the harness, the method, and the banded aggregate
+# tables. Anything not listed above is public.
+.env
+runs/
+t2.local.json
+T2-tasks.md
+corpus-manifest.json
+ground-truth/
+reports/*.local.*
+repositories/
+work/
+probe/
+*.log
+__pycache__/
+.ruff_cache/
+.cavet/
+.run.lock
+*.err

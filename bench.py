@@ -1449,6 +1449,8 @@ def load_records(dir_path: Path = None) -> dict:
     if base.exists():
         for p in base.glob("*.json"):
             r = json.loads(p.read_text(encoding="utf-8"))
+            if "run_id" not in r:
+                continue  # scheduler-state.json and other non-record files
             out[r["run_id"]] = r
     return out
 
@@ -1975,10 +1977,16 @@ SCHED_STATE = RUNS / "scheduler-state.json"
 def rotation_pairs(env) -> list:
     """Resolve the ROTATION order into (harness, model) pairs. Entries match
     a configured pair by exact model id or harness/model; `muse-spark-zen`
-    is the documented shorthand for the opencode-hosted free route. Configured
-    pairs missing from the list are appended in .env order so nothing can be
-    silently dropped from the matrix."""
-    order = os.environ.get("ROTATION") or env.get("ROTATION") or DEFAULT_ROTATION
+    is the documented shorthand for the opencode-hosted free route.
+
+    An explicit ROTATION is the exact set: pairs left out are paused, not
+    appended - that is the mechanism for sitting a pair out (allocation
+    exhausted, operator at work on that subscription). Only the implicit
+    default appends configured-but-unlisted pairs, so a newly configured
+    pair can never be silently dropped from the matrix."""
+    raw = os.environ.get("ROTATION") or env.get("ROTATION") or ""
+    explicit = bool(raw.strip())
+    order = raw if explicit else DEFAULT_ROTATION
     pairs = pairs_from_env(env)
     rot = []
     for entry in [x.strip() for x in order.split(",") if x.strip()]:
@@ -1997,9 +2005,10 @@ def rotation_pairs(env) -> list:
                      f"Configured: {[f'{h}/{m}' for h, m in pairs]}")
         if match not in rot:
             rot.append(match)
-    for p in pairs:
-        if p not in rot:
-            rot.append(p)
+    if not explicit:
+        for p in pairs:
+            if p not in rot:
+                rot.append(p)
     return rot
 
 

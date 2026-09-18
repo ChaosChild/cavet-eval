@@ -46,6 +46,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, asdict, field
@@ -178,33 +179,23 @@ def cavet_provenance(env) -> dict:
     b = cavet_bin(env)
     prov = {"binary": b, "version": "", "engine_digest": ""}
     try:
-        v = subprocess.run([b, "--version"], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=60,
-                           stdin=subprocess.DEVNULL)
-        prov["version"] = ((v.stdout or "") + (v.stderr or "")).strip() \
-            or f"rc={v.returncode}"
+        v = _run_cmd([b, "--version"], timeout=60)
+        prov["version"] = (v["out"] + v["err"]).strip() or f"rc={v['rc']}"
     except Exception as e:
         prov["version"] = f"error: {type(e).__name__}: {e}"
     try:
-        img = subprocess.run(
+        img = _run_cmd(
             ["docker", "image", "inspect", "--format",
-             "{{index .RepoDigests 0}}", CAVET_ENGINE_IMAGE],
-            capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=120)
-        prov["engine_digest"] = (img.stdout or "").strip() \
-            or f"inspect rc={img.returncode}"
+             "{{index .RepoDigests 0}}", CAVET_ENGINE_IMAGE], timeout=120)
+        prov["engine_digest"] = img["out"].strip() \
+            or f"inspect rc={img['rc']}"
     except Exception as e:
         prov["engine_digest"] = f"error: {type(e).__name__}: {e}"
     return prov
 
 
 def cavet_init(env, d: Path) -> dict:
-    r = subprocess.run([cavet_bin(env), "init"], cwd=str(d),
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", timeout=600,
-                       stdin=subprocess.DEVNULL)
-    return {"rc": r.returncode, "out": (r.stdout or "")[-400:],
-            "err": (r.stderr or "")[-400:]}
+    return _run_cmd([cavet_bin(env), "init"], cwd=d, timeout=600)
 
 
 def our_cavet_containers(work_root: Path) -> list:
@@ -216,18 +207,16 @@ def our_cavet_containers(work_root: Path) -> list:
     Containers belonging to other sessions' repositories never match and
     are never touched: the operator runs other cavet sessions on this host.
     """
-    ids = subprocess.run(["docker", "ps", "-q", "--filter", "name=cavet-"],
-                         capture_output=True, text=True,
-                         timeout=120).stdout.split()
+    ids = _run_cmd(["docker", "ps", "-q", "--filter", "name=cavet-"],
+                   timeout=120)["out"].split()
     markers = [str(work_root).lower(),
                str(work_root).replace("\\", "/").lower()]
     ours = []
     for cid_ in ids:
         try:
-            binds = subprocess.run(
+            binds = _run_cmd(
                 ["docker", "inspect", "--format", "{{.HostConfig.Binds}}",
-                 cid_], capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=60).stdout.lower()
+                 cid_], timeout=60)["out"].lower()
         except Exception:
             continue
         if any(m in binds for m in markers):
@@ -242,17 +231,17 @@ def stop_engine_scoped(env, d: Path) -> dict:
     cavet's own `engine prune` would also sweep pre-existing orphans from
     OTHER sessions, which the standing docker-safety rule forbids touching;
     the operator may run it by hand if wanted."""
-    stop = subprocess.run([cavet_bin(env), "engine", "stop"], cwd=str(d),
-                          capture_output=True, text=True, timeout=180,
-                          stdin=subprocess.DEVNULL)
-    rec = {"rc": stop.returncode, "out": (stop.stdout or "")[-400:],
-           "err": (stop.stderr or "")[-400:]}
+    stop = _run_cmd([cavet_bin(env), "engine", "stop"], cwd=d, timeout=180)
+    rec = {"rc": stop["rc"], "out": stop["out"], "err": stop["err"]}
+    if stop["timed_out"]:
+        rec["stop_timed_out"] = True
     left = our_cavet_containers(WORK)
     if left:
-        subprocess.run(["docker", "rm", "-f", *left],
-                       capture_output=True, timeout=180)
+        rm = _run_cmd(["docker", "rm", "-f", *left], timeout=180)
         rec["forced"] = len(left)
         rec["forced_ids"] = left
+        if rm["timed_out"]:
+            rec["rm_timed_out"] = True
     return rec
 
 
@@ -819,6 +808,33 @@ def _kill_tree(pid: int):
             os.killpg(os.getpgid(pid), 9)
     except Exception:
         pass
+
+
+def _run_cmd(cmd, cwd=None, timeout: int = 180) -> dict:
+    """Pipe-safe subprocess.run for cavet/docker teardown calls.
+
+    run(timeout=...) kills the direct child on expiry but then waits for the
+    stdout/stderr pipes to close — and on Windows a grandchild (docker.exe
+    spawned by a cavet CLI, inheriting the handles) keeps them open forever,
+    so the read blocks past the timeout. That froze one cell's teardown for
+    30 minutes on 2026-09-18. Redirecting to files has no EOF to wait on, and
+    a tree-kill on expiry cannot deadlock. Returns {rc, out, err, timed_out};
+    rc is None when the call had to be killed.
+    """
+    with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+        proc = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None,
+                                stdout=fo, stderr=fe,
+                                stdin=subprocess.DEVNULL)
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc.pid)
+            rc = None
+        fo.seek(0)
+        fe.seek(0)
+        out = fo.read().decode("utf-8", errors="replace")[-400:]
+        err = fe.read().decode("utf-8", errors="replace")[-400:]
+    return {"rc": rc, "out": out, "err": err, "timed_out": rc is None}
 
 
 def actual_model(ctx) -> str:
@@ -1890,13 +1906,14 @@ def _run_armc(args, env):
     patch.unlink(missing_ok=True)
 
     def headless_scan(tag: str):
-        r = subprocess.run([cavet_bin(env), "scan", "--full"], cwd=str(d),
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=scan_timeout,
-                           stdin=subprocess.DEVNULL)
+        r = _run_cmd([cavet_bin(env), "scan", "--full"], cwd=d,
+                     timeout=scan_timeout)
         (logs / f"scan_{tag}.txt").write_text(
-            (r.stdout or "") + (r.stderr or ""), encoding="utf-8")
-        return r
+            (r["out"] or "") + (r["err"] or ""), encoding="utf-8")
+
+        class _R:
+            stdout, returncode = r["out"], r["rc"]
+        return _R()
 
     scan1 = headless_scan("before")
     scan1_res = parse_scan_result(scan1.stdout)

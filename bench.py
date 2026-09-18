@@ -540,13 +540,47 @@ def _event_usage(ev: dict):
 def last_usage_event(events: list) -> dict:
     """The terminal usage-bearing event, lifted into result-json shape so the
     shared extractor and actual_model keep working unchanged. On a completed
-    qwen run that is the terminal `result` event with SESSION-TOTAL usage; on
-    a timed-out run the last complete event is the best available recovery.
+    qwen run that is the terminal `result` event with SESSION-TOTAL usage.
+
+    On a timed-out run that event never arrives, and each assistant message
+    carries only ITS OWN turn's usage — so the recovery SUMS usage over unique
+    assistant messages and returns a synthetic result event. The previous
+    last-event lift reported one turn out of 108 as the whole session on a
+    real 1800s qwen3.8-max timeout ($2.05 of spend read as $0.00).
 
     Costing rule preserved (README 5.2): qwen's input_tokens INCLUDE cached
     tokens, so `normalise("inclusive", ...)` subtracts cache reads - never
     double-count. The fixture selftest pins this.
     """
+    for ev in reversed(events):
+        if isinstance(ev.get("usage"), dict):
+            return ev
+    total = {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_input_tokens": 0,
+             "cache_creation_input_tokens": 0, "total_tokens": 0}
+    seen = set()
+    model = None
+    found = False
+    for ev in events:
+        if ev.get("type") != "assistant":
+            continue
+        msg = ev.get("message") or {}
+        u = msg.get("usage")
+        if not isinstance(u, dict):
+            continue
+        mid = msg.get("id")
+        if mid is not None:
+            if mid in seen:
+                continue
+            seen.add(mid)
+        found = True
+        model = msg.get("model") or model
+        for k in total:
+            total[k] += int(u.get(k) or 0)
+    if found:
+        return {"type": "result", "usage": total, "model": model,
+                "recovered_from_stream": True}
+    # last resort: the newest usage-bearing event of any shape
     for ev in reversed(events):
         usage, ev2 = _event_usage(ev)
         if usage is not None:
@@ -1200,6 +1234,31 @@ def cmd_selftest(_args):
                     blob_t["usage"].get("cache_read_input_tokens", 0),
                     0, blob_t["usage"]["output_tokens"])
     check("truncated stream uncached", u_t.uncached_input, 200)
+    # Multi-turn timeout: each assistant message carries only its own turn's
+    # usage, so recovery must SUM unique messages. The previous last-event
+    # lift reported one turn out of 108 as the whole session on a real 1800s
+    # qwen3.8-max timeout (2026-09-18): $2.05 of spend read as $0.00.
+    a1 = json.dumps({"type": "assistant", "message": {"id": "m1",
+        "model": "qwen3.8-max",
+        "usage": {"input_tokens": 1000, "output_tokens": 50,
+                  "cache_read_input_tokens": 800}}})
+    a2 = json.dumps({"type": "assistant", "message": {"id": "m2",
+        "model": "qwen3.8-max",
+        "usage": {"input_tokens": 2000, "output_tokens": 70,
+                  "cache_read_input_tokens": 1900}}})
+    multi = stream_fixture.splitlines()[0] + "\n" + a1 + "\n" + a2 + \
+        "\n" + a1 + "\n" + '{"trun'  # duplicate id must not double-count
+    evs_m = parse_stream_events(multi)
+    blob_m = last_usage_event(evs_m)
+    check("multi-turn timeout sums input", blob_m["usage"]["input_tokens"], 3000)
+    check("multi-turn timeout sums output", blob_m["usage"]["output_tokens"], 120)
+    check("multi-turn dedupe by message id",
+          blob_m["usage"]["cache_read_input_tokens"], 2700)
+    check("multi-turn recovery flagged", blob_m.get("recovered_from_stream"), True)
+    u_m = normalise("inclusive", blob_m["usage"]["input_tokens"],
+                    blob_m["usage"]["cache_read_input_tokens"], 0,
+                    blob_m["usage"]["output_tokens"])
+    check("multi-turn uncached", u_m.uncached_input, 300)
     # legacy -o json whole-array output must keep parsing
     check("legacy array parses", len(parse_stream_events(
         "[" + stream_fixture.replace("\n", ",") + "]")), 3)
